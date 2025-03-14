@@ -1,0 +1,214 @@
+import os
+import pdfplumber
+import pandas as pd
+from openpyxl import load_workbook
+import re
+
+# 📂 File paths
+pdf_folder = r"D:\Python\GST"
+excel_path = r"D:\Python\GSTR3B_Output.xlsx"
+
+# 🏷️ Mapping row descriptions to Excel columns
+excel_columns = {
+    "outward": {"taxable": "C", "central": "G", "state_ut": "H"},  # Removed "integrated": "F"
+    "outward_zero_rated": {"taxable": "D"},  # Removed "integrated": "F"
+    "inward": {"taxable": "K", "integrated": "L", "central": "M", "state_ut": "N"}
+}
+
+# 🎯 ITC rows and additional rows to extract
+itc_rows = [
+    "(1) Import of goods", "(2) Import of services",
+    "(3) Inward supplies liable to reverse charge (other than 1 & 2 above)",
+    "(4) Inward supplies from ISD", "(5) All other ITC"
+]
+additional_rows = ["(2) Others", "(1) As per rules 38,42 & 43 of CGST Rules and section 17(5)", "C. Net ITC available (A-B)"]
+
+# 🔎 Function to extract GSTIN number
+def extract_gstin(lines):
+    print("\n🔍 Debugging GSTIN Extraction...")
+    for i, line in enumerate(lines):
+        print(f"📜 Checking Line {i + 1}: {line}")  # Debugging
+
+        # ✅ Check for "GSTIN of the supplier" or "1. GSTIN"
+        if "GSTIN of the supplier" in line or "1. GSTIN" in line:
+            print(f"✅ Found GSTIN Keyword in Line {i + 1}: {line}")  # Debugging
+
+            # Extract GSTIN using regex
+            match = re.search(r"\b\d{2}[A-Z]{5}\d{4}[A-Z]{1}[A-Z\d]{1}[Z]{1}[A-Z\d]{1}\b", line)
+            if match:
+                print(f"✅ Extracted GSTIN: {match.group(0)}")  # Debugging
+                return match.group(0)
+
+            # 🔍 Check next line for GSTIN
+            if i + 1 < len(lines):
+                match_next = re.search(r"\b\d{2}[A-Z]{5}\d{4}[A-Z]{1}[A-Z\d]{1}[Z]{1}[A-Z\d]{1}\b", lines[i + 1])
+                if match_next:
+                    print(f"✅ Extracted GSTIN from next line: {match_next.group(0)}")  # Debugging
+                    return match_next.group(0)
+
+    print("⚠️ GSTIN not found!")  # Debugging
+    return ""
+
+# 🔎 Function to extract Integrated Tax values
+def extract_integrated_tax(lines):
+    integrated_tax_a = 0.0
+    integrated_tax_b = 0.0
+
+    print("\n🔍 Debugging Integrated Tax Extraction...")
+    for i, line in enumerate(lines):
+        print(f"📜 Checking Line {i + 1}: {line}")  # Debugging
+
+        # Extract Integrated Tax for (a) Outward taxable supplies (other than zero rated, nil rated)
+        if "(a) Outward taxable supplies (other than zero rated, nil rated" in line:
+            print(f"✅ Found '(a) Outward taxable supplies' in Line {i + 1}: {line}")  # Debugging
+            numbers = re.findall(r"[-+]?\d*\.\d+|\d+", line)
+            print(f"🔢 Extracted Numbers: {numbers}")  # Debugging
+            if len(numbers) > 1:
+                integrated_tax_a = float(numbers[1])  # Extract 2nd number as Integrated Tax
+                print(f"✅ Extracted Integrated Tax (a): {integrated_tax_a}")  # Debugging
+
+        # Extract Integrated Tax for (b) Outward taxable supplies (zero rated)
+        if "(b) Outward taxable supplies (zero rated)" in line:
+            print(f"✅ Found '(b) Outward taxable supplies (zero rated)' in Line {i + 1}: {line}")  # Debugging
+            numbers = re.findall(r"[-+]?\d*\.\d+|\d+", line)
+            print(f"🔢 Extracted Numbers: {numbers}")  # Debugging
+            if len(numbers) > 1:
+                integrated_tax_b = float(numbers[1])  # Extract 2nd number as Integrated Tax
+                print(f"✅ Extracted Integrated Tax (b): {integrated_tax_b}")  # Debugging
+
+    total_integrated_tax = integrated_tax_a + integrated_tax_b  # Sum of both values
+    print(f"✅ Total Integrated Tax (a + b): {total_integrated_tax}")  # Debugging
+    return integrated_tax_a, integrated_tax_b, total_integrated_tax
+
+# 🔎 Function to search for text in the same row
+def extract_values_from_row(text, lines):
+    for i, line in enumerate(lines):
+        if text in line:
+            numbers = re.findall(r"\b\d+\.\d{2}\b", line)
+            if len(numbers) >= 3:
+                return {"integrated": float(numbers[0]), "central": float(numbers[1]), "state_ut": float(numbers[2])}
+    return {"integrated": 0.0, "central": 0.0, "state_ut": 0.0}
+
+# 📌 Extract values from PDF
+def extract_values(pdf_path):
+    extracted_values = {"outward": {}, "outward_zero_rated": {}, "inward": {}}
+    total_itc = {"integrated": 0.0, "central": 0.0, "state_ut": 0.0}
+    others_values = {"integrated": 0.0, "central": 0.0, "state_ut": 0.0}
+    rules_values = {"integrated": 0.0, "central": 0.0, "state_ut": 0.0}
+    net_itc_values = {"integrated": 0.0, "central": 0.0, "state_ut": 0.0}
+
+    period = ""
+    gstin = ""
+
+    with pdfplumber.open(pdf_path) as pdf:
+        lines = [line.strip() for page in pdf.pages for line in page.extract_text().split("\n") if page.extract_text()]
+
+        # 🆔 Extract GSTIN
+        gstin = extract_gstin(lines)
+
+        # 🏷 Extract Integrated Tax values
+        integrated_tax_a, integrated_tax_b, total_integrated_tax = extract_integrated_tax(lines)
+
+        for line in lines:
+            # 🗓 Extract period (Month)
+            if not period:
+                match = re.search(r"(January|February|March|April|May|June|July|August|September|October|November|December)", line)
+                if match:
+                    period = match.group(0)
+
+            # 🏷 Extract Outward Supplies
+            if "(a) Outward taxable supplies" in line:
+                numbers = re.findall(r"\b\d+\.\d{2}\b", line)
+                if len(numbers) >= 4:
+                    extracted_values["outward"] = {
+                        "taxable": numbers[0],
+                        "central": numbers[2],
+                        "state_ut": numbers[3]
+                    }
+
+            # 🏷 Extract Outward Supplies (Zero Rated)
+            if "(b) Outward taxable supplies (zero rated)" in line:
+                numbers = re.findall(r"\b\d+\.\d{2}\b", line)
+                if len(numbers) >= 2:
+                    extracted_values["outward_zero_rated"] = {
+                        "taxable": numbers[0]
+                    }
+
+            # 🏷 Extract Inward Supplies
+            if "(d) Inward supplies" in line:
+                numbers = re.findall(r"\b\d+\.\d{2}\b", re.sub(r'[^\d.\s]', '', line))  # Remove unwanted characters
+                if len(numbers) >= 4:
+                    extracted_values["inward"] = {
+                        "taxable": numbers[0],
+                        "integrated": numbers[1],
+                        "central": numbers[2],
+                        "state_ut": numbers[3]
+                    }
+
+        # 🔢 Extract ITC values
+        for itc_key in itc_rows:
+            itc_values = extract_values_from_row(itc_key, lines)
+            total_itc["integrated"] += itc_values["integrated"]
+            total_itc["central"] += itc_values["central"]
+            total_itc["state_ut"] += itc_values["state_ut"]
+
+        # 🏛 Extract "(2) Others" and other additional values correctly
+        others_values = extract_values_from_row("(2) Others", lines)
+        rules_values = extract_values_from_row("(1) As per rules 38,42 & 43 of CGST Rules and section 17(5)", lines)
+        net_itc_values = extract_values_from_row("C. Net ITC available (A-B)", lines)
+
+    return gstin, period, integrated_tax_a, integrated_tax_b, total_integrated_tax, extracted_values, total_itc, others_values, rules_values, net_itc_values
+
+# 📑 Load or create Excel file
+try:
+    book = load_workbook(excel_path)
+except FileNotFoundError:
+    pd.DataFrame().to_excel(excel_path, index=False, engine='openpyxl')
+    book = load_workbook(excel_path)
+
+sheet = book.active  # Select first sheet
+
+# 🔄 Process PDFs
+pdf_files = [f for f in os.listdir(pdf_folder) if f.endswith(".pdf")]
+start_row = 8  # Start writing from row 8
+
+for pdf_file in pdf_files:
+    pdf_path = os.path.join(pdf_folder, pdf_file)
+    print(f"📂 Processing {pdf_file}...")
+
+    # 📊 Extract values
+    gstin, period, integrated_tax_a, integrated_tax_b, total_integrated_tax, extracted_values, total_itc, others_values, rules_values, net_itc_values = extract_values(pdf_path)
+
+    # ✅ Write GSTIN and Period to Excel
+    sheet[f"A{start_row}"] = gstin  # Write GSTIN to Column A
+    sheet[f"B{start_row}"] = period  # Write Period to Column B
+
+    # ✅ Write Integrated Tax to Column F
+    sheet[f"F{start_row}"] = total_integrated_tax  # Write Total Integrated Tax to Column F
+    print(f"📝 Writing to F{start_row}: {total_integrated_tax}")  # Debugging
+
+    # 🖊 Write values to the correct cells
+    for key, cells in excel_columns.items():
+        if key in extracted_values and extracted_values[key]:
+            for field, col in cells.items():
+                if field in extracted_values[key]:
+                    sheet[f"{col}{start_row}"] = f"₹{extracted_values[key][field]}"
+                    print(f"📝 Writing to {col}{start_row}: ₹{extracted_values[key][field]}")  # Debugging
+
+    # 🔢 Ensure ITC values are correctly written in Z to AB
+    col_map = ["R", "S", "T", "U", "V", "W", "X", "Y", "Z", "AA", "AB", "AC"]
+    values_map = list(total_itc.values()) + list(others_values.values()) + list(rules_values.values()) + list(net_itc_values.values())
+
+    for col, val in zip(col_map, values_map):
+        sheet[f"{col}{start_row}"] = f"₹{val if val != '' else '0.00'}"
+        print(f"📝 Writing to {col}{start_row}: ₹{val if val != '' else '0.00'}")  # Debugging
+
+    start_row += 1  # Move to the next row
+
+# 💾 Save file
+book.save(excel_path)
+print(f"✅ Data saved to {excel_path}")
+# Copyright (c) 2025 Munaga V R M Varshith
+# All rights reserved.
+#
+# Licensed under the MIT License. See the LICENSE file for details.
